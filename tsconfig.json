@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "esModuleInterop": true,
+    "moduleResolution": "node",
+    "jsx": "react",
+    "module": "commonjs",
+    "target": "es5",
+    "allowJs": false,
+    "noUnusedLocals": false,
+    "preserveConstEnums": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "inlineSources": true,
+    "declaration": true,
+    "experimentalDecorators": true,
+    "downlevelIteration": true,
+    "strictNullChecks": true,
+    "baseUrl": ".",
+    "paths": {
+      "@odinlin/formily-antd": ["packages/antd/src"],
+      "@odinlin/formily-antdv": ["packages/antdv/src"],
+    },
+    "lib": ["ESNext", "DOM"]
+  },
+  "include": [
+    "./**/*.d.ts",
+    "./**/*.ts",
+    "./**/*.tsx",
+    "./**/*.vue"
+  ]
+}

@@ -1,0 +1,11 @@
+# deps
+node_modules
+pnpm-lock.yaml
+
+# dev assets
+.dumi/tmp
+
+# build assets
+dist
+esm
+lib
