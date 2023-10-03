@@ -1,6 +1,9 @@
 import React from 'react'
 import { LoadingOutlined } from '@ant-design/icons'
 
+// 常量字符串: 终止 fetch 请求的原因
+export const SELECT2_ABORT_REASON = 'DROPDOWN_HIDDEN'
+
 // 外部传入的 props 属性，可直接被覆盖
 export const defaultNotFoundContent = (
   <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', padding: '5px 12px', color: 'rgba(0, 0, 0, 0.25)', cursor: 'default' }} >

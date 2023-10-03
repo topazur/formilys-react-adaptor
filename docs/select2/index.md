@@ -14,3 +14,7 @@ group:
 ## JSON Schema case
 
 <code src="../demos/select2/Schema.tsx"></code>
+
+## Dom
+
+<code src="../demos/select2/Slot.tsx"></code>

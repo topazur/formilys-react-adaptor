@@ -1,22 +1,21 @@
 import React from 'react'
+import { isArr, isEmpty } from '@formily/shared'
 import { connect, mapProps, mapReadPretty } from '@formily/react'
-import { debounce } from 'throttle-debounce'
+import { useControllableValue, useDebounceFn, useGetState, useLockFn, useMemoizedFn } from 'ahooks'
 import { Select as AntdSelect } from 'antd'
 import { LoadingOutlined } from '@ant-design/icons'
 import { PreviewText } from '@formily/antd-v5'
 
 import {
-  SELECT2_IDENTIFIER_NOMORE,
-  SELECT2_IDENTIFIER_PROGRESS,
-  deafultRequestInProgress,
-  deafultRequestNoMore,
+  SELECT2_ABORT_REASON,
   defaultNotFoundContent,
 } from './option-definition'
+import { useAbortController, useMergeOptions } from './hooks'
 
-import type { BaseOptionType, DefaultOptionType, SelectProps } from 'antd/lib/select'
 import type { ReactFC } from '@formily/react'
+import type { BaseOptionType, DefaultOptionType, SelectProps } from 'antd/lib/select'
 
-export { SELECT2_IDENTIFIER_NOMORE, SELECT2_IDENTIFIER_PROGRESS } from './option-definition'
+export { SELECT2_ABORT_REASON, SELECT2_IDENTIFIER_NOMORE, SELECT2_IDENTIFIER_PROGRESS } from './option-definition'
 
 /**
  * ISelect2Props 继承并覆写了 AntdSelectProps 接口
@@ -25,7 +24,7 @@ export interface ISelect2Props<ValueType = any, OptionType extends DefaultOption
   // 首次打开下拉框是否自动加载数据
   firstLoad?: boolean
   // 异步函数
-  loadData?: (q: string, offset: number) => Promise<OptionType[]>
+  loadData?: (signal: AbortSignal, opts: { q: string; offset: number }) => Promise<any[]>
 }
 
 /**
@@ -37,19 +36,29 @@ export interface ISelect2Props<ValueType = any, OptionType extends DefaultOption
  * @notice // NOTICE: 自定义该选项的样式: `option-identifier-*`
  * @notice // NOTICE: `filterOption={false}` => 必须关闭选项过滤 local 数据，而是通过 onSearch 过滤 remote 数据
  * @notice // NOTICE: `virtual={false}` => 关闭虚拟滚动，否则滚动无法监测触底
- * @notice // NOTICE: 首次打开下拉列表时触发搜索 => `((showSearch ? firstLoad : true) && open)`
+ *
+ * @notice // NOTICE: 首次打开下拉列表时触发搜索 => 可搜索：`showSearch && innerOpen && firstLoad`；每次打开都要重新搜索，因为 search值 可能已改变，保存的选项可能不正确
+ * @notice // NOTICE: 首次打开下拉列表时触发搜索 => 不可搜索：`!showSearch && innerOpen && getOptions().length <= 0`；不可搜索时没有 search值 的影响，可以保留上次请求结果
+ *
+ * @notice // NOTICE: 当搜索框有值时，直接关闭弹窗，此时也会触发 onSearch 搜索，search值为空。这里阻止掉该情况
  */
-const InternalSelect2: React.FC<ISelect2Props> = (props) => {
+function InternalSelect2<ValueType = any, OptionType extends BaseOptionType | DefaultOptionType = DefaultOptionType>(props: ISelect2Props<ValueType, OptionType>) {
   const {
-    value,
-    onChange,
-    onDropdownVisibleChange,
+    /* 默认值 */
+    listHeight = 200,
+    listItemHeight = 24,
+    labelInValue = true,
+    showSearch = true,
+    notFoundContent = defaultNotFoundContent,
+
+    /* 劫持 */
     // suffixIcon,
     loading,
-    showSearch = true,
-    labelInValue = true,
+    onSearch,
+    onDropdownVisibleChange,
 
-    firstLoad,
+    /* 自定义异步加载 */
+    firstLoad = true,
     loadData,
 
     ...restProps
@@ -57,92 +66,90 @@ const InternalSelect2: React.FC<ISelect2Props> = (props) => {
 
   /**
    * @title 劫持 value 的 state，方便回显
+   * @desc 需要组件的状态既可以自己管理，也可以被外部控制
    */
-  const [internalValue, setInternalValue] = React.useState<any>(value)
+  const [innerValue, setInnerValue] = useControllableValue<any>(props, {
+    defaultValue: null,
+    defaultValuePropName: 'defaultValue',
+    valuePropName: 'value',
+    trigger: 'onChange',
+  })
+
+  /**
+   * @title 劫持 open 的 state，方便判断仅在下拉框开启时才触发搜索
+   * @desc 需要组件的状态既可以自己管理，也可以被外部控制
+   */
+  const [innerOpen, setInnerOpen] = useControllableValue<boolean | undefined>(props, {
+    defaultValue: undefined,
+    defaultValuePropName: 'defaultOpen',
+    valuePropName: 'open',
+    trigger: 'onDropdownVisibleChange',
+  })
+
+  // 存储选项列表，方便获取到当前最新的选项列表的长度
+  const [options, setOptions, getOptions] = useGetState<any[]>([])
+
+  /**
+   * @title 取消请求
+   */
+  const [abortControllerRef, getRefreshSignal] = useAbortController()
 
   /**
    * @title 异步请求相关状态
    */
-  const [stateInProgress, setStateInProgress] = React.useState<boolean>(false) // 是否正在请求中
-  const [stateNoMore, setStateNoMore] = React.useState<boolean>(false) // 是否还有更多未加载
-  const [options, setOptions] = React.useState<any[]>([]) // 存储选项列表
-
-  /**
-   * @title 滚动加载相关状态
-   */
-  const searchValueRef = React.useRef<string>('') // 存储当前搜索值，用于在下拉滚动时引用
-  const prevOptionsLenRef = React.useRef<number>(0) // 存储上一次的选项长度，用于在下拉滚动时引用
-  const popupScrollLockRef = React.useRef<boolean>(false) // 存储下拉滚动锁定状态，用于在下拉滚动时引用
+  // 是否正在请求中
+  const [loadInProgress, setLoadInProgress] = React.useState<boolean>(false)
+  // 是否没有更多未加载的，为 true 时已加载完毕
+  const [loadNoMore, setLoadNoMore] = React.useState<boolean>(false)
+  // 存储当前搜索值，用于在下拉滚动时引用
+  const searchValueRef = React.useRef<string>('')
 
   /**
    * @title 对 options 进行包装处理
    */
-  const mergeOptions = React.useMemo<any[]>(() => {
-    // 如果没有选项，则返回空数组；如果正在加载中，则返回加载选项
-    if (options.length <= 0) {
-      if (stateInProgress) {
-        return options.concat({
-          value: SELECT2_IDENTIFIER_PROGRESS,
-          disabled: true,
-          label: deafultRequestInProgress,
-        })
-      }
-      return []
-    }
-
-    // 如果没有更多数据，给出描述
-    if (stateNoMore) {
-      return options.concat({
-        className: 'option-identifier-nomore',
-        value: SELECT2_IDENTIFIER_NOMORE,
-        disabled: true,
-        label: deafultRequestNoMore,
-      })
-    }
-
-    // 如果正在请求中或者没在加载时，给出加载提示
-    return options.concat({
-      className: 'option-identifier-progress',
-      value: SELECT2_IDENTIFIER_PROGRESS,
-      disabled: true,
-      label: deafultRequestInProgress,
-    })
-  }, [options, stateInProgress, stateNoMore])
+  const mergeOptions = useMergeOptions(options, loadInProgress, loadNoMore)
 
   /**
    * @title 搜索框键入的防抖查询函数
    * @desc 重置选项列表；offset重置为0
    */
-  const onSearchDebounceFetcher = React.useMemo(() => {
-    const onSearch = async (q: string) => {
+  const { run: onSearchDebounceRun, cancel: onSearchDebounceCancel, flush: onSearchDebounceFlush } = useDebounceFn(
+    async (q: string) => {
       searchValueRef.current = q
 
-      try {
-        setStateNoMore(false)
-        setStateInProgress(true)
-        setOptions([])
+      // 当搜索框有值时，直接关闭弹窗，此时也会触发 onSearch 搜索，search值为空。这里阻止掉该情况，不能简单的判断 search值为空 就阻止
+      if (!innerOpen) { return }
 
-        const response = await loadData?.(q, 0)
-        if (response && response.length > 0) {
+      try {
+        setLoadNoMore(false)
+        setOptions([])
+        setLoadInProgress(true)
+
+        const response = await loadData?.(getRefreshSignal(), { q, offset: 0 })
+        if (isArr(response) && !isEmpty(response)) {
           setOptions(response)
         }
       }
       catch (error) { }
       finally {
-        setStateInProgress(false)
+        setLoadInProgress(false)
       }
-    }
-
-    return debounce(800, onSearch)
-  }, [loadData])
+    },
+    {
+      wait: 500,
+      leading: false,
+      trailing: true,
+      maxWait: undefined,
+    },
+  )
 
   /**
    * @title 下拉列表滚动时的回调，增加静态锁 <触底操作只能等待异步函数完成之后才能再次触发>
    * @desc 往选项列表累加；offset 为上一次的 options 长度
    */
-  const onPopupScrollLockFetcher = React.useCallback(async (event: React.UIEvent<HTMLDivElement, UIEvent>) => {
+  const onPopupScrollLock = useLockFn(async (event: React.UIEvent<HTMLDivElement, UIEvent>) => {
     // 没有更多了，则无需触发滚动加载
-    if (stateNoMore) { return }
+    if (loadNoMore) { return }
 
     const { scrollTop, scrollHeight, clientHeight } = event.target as HTMLDivElement
     // 容差值是为了避免由于浏览器像素差异等问题导致的误判
@@ -152,76 +159,83 @@ const InternalSelect2: React.FC<ISelect2Props> = (props) => {
       return
     }
 
-    // 增加竞态锁
-    if (popupScrollLockRef.current) { return }
-
     try {
-      popupScrollLockRef.current = true
-      setStateInProgress(true)
+      setLoadInProgress(true)
 
-      const response = await loadData?.(searchValueRef.current, prevOptionsLenRef.current)
-      if (response && response.length > 0) {
+      const response = await loadData?.(getRefreshSignal(), { q: searchValueRef.current, offset: getOptions().length })
+      if (isArr(response) && !isEmpty(response)) {
         setOptions(value => ([...value, ...response]))
       }
       else {
-        setStateNoMore(true)
+        setLoadNoMore(true)
       }
     }
     catch (error) { }
     finally {
-      popupScrollLockRef.current = false
-      setStateInProgress(false)
+      setLoadInProgress(false)
     }
-  }, [stateNoMore, loadData])
-
-  /**
-   * @title 劫持 onChange 方法
-   */
-  const internalChangeHandle = React.useCallback((value: any, option: any) => {
-    // 外部存储字符串
-    onChange?.(value, option)
-    // 内部存储整个对象，用于回显
-    setInternalValue(value)
-  }, [onChange])
+  })
 
   /**
    * @title 劫持 onDropdownVisibleChange 方法
    */
-  const internalDropdownVisibleChangeHandle = React.useCallback((open: boolean) => {
-    onDropdownVisibleChange?.(open)
+  const innerDropdownVisibleChangeHandle = useMemoizedFn((visible: boolean) => {
+    setInnerOpen(visible)
+    onDropdownVisibleChange?.(visible)
 
     // showSearch 开启时，根据 firstLoad 判断是否首次打开下拉列表时触发搜索
-    // showSearch 未开启时，默认首次打开下拉列表时触发搜索
-    if ((showSearch ? firstLoad : true) && open) {
-      onSearchDebounceFetcher('')
+    if (showSearch) {
+      setOptions([]) // 提前清空，防止渲染延迟
+      visible && firstLoad && onSearchDebounceRun('')
     }
-  }, [showSearch, firstLoad, onDropdownVisibleChange])
+    else {
+      // showSearch 未开启时，默认首次打开下拉列表时触发搜索；后续打开时 若 options 为空，才触发搜索
+      visible && getOptions().length <= 0 && onSearchDebounceRun('')
+    }
+  })
 
   /**
-   * @title 监听
+   * @title 下拉框关闭时手动触发 abort 方法
    */
   React.useEffect(() => {
-    prevOptionsLenRef.current = options.length
-  }, [options.length])
+    // 当下拉框已关闭，则手动触发 abort 方法
+    !innerOpen && abortControllerRef.current.abort(SELECT2_ABORT_REASON)
+  }, [innerOpen])
+
+  /**
+   * @title 卸载清除副作用
+   */
+  React.useEffect(() => {
+    return () => {
+      // 卸载时直接结束可能存在的上一次请求
+      abortControllerRef.current.abort(SELECT2_ABORT_REASON)
+
+      // 取消当前可能存在的防抖
+      onSearchDebounceCancel()
+    }
+  }, [])
 
   return (
     <AntdSelect
-      notFoundContent={defaultNotFoundContent}
-      listHeight={200}
       {...restProps}
       filterOption={false}
       virtual={false}
-      /* 以下属性经过包装处理 */
+      /* 默认值 */
+      listHeight={listHeight}
+      listItemHeight={listItemHeight}
       labelInValue={labelInValue}
-      // suffixIcon={stateInProgress ? <LoadingOutlined /> : suffixIcon}
-      loading={stateInProgress || loading}
-      value={internalValue}
-      onChange={internalChangeHandle}
-      options={mergeOptions}
       showSearch={showSearch}
-      onSearch={showSearch ? onSearchDebounceFetcher : undefined}
-      onDropdownVisibleChange={internalDropdownVisibleChangeHandle}
-      onPopupScroll={onPopupScrollLockFetcher}
+      notFoundContent={notFoundContent}
+      /* 劫持 */
+      options={mergeOptions}
+      value={innerValue}
+      onChange={setInnerValue}
+      // suffixIcon={loadInProgress ? <LoadingOutlined /> : suffixIcon}
+      loading={loadInProgress || loading}
+      open={innerOpen}
+      onDropdownVisibleChange={innerDropdownVisibleChangeHandle}
+      onSearch={showSearch ? onSearchDebounceRun : undefined}
+      onPopupScroll={onPopupScrollLock}
     />
   )
 }

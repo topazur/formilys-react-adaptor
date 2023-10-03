@@ -45,6 +45,7 @@
     "@formily/reactive": "^2.2.0",
     "@formily/reactive-react": "^2.2.0",
     "@formily/shared": "^2.2.0",
+    "ahooks": "^3.7.8",
     "classnames": "^2.2.6",
     "react-sticky-box": "^2.0.5",
     "throttle-debounce": "^5.0.0"

@@ -11,6 +11,7 @@
     "tsconfig.json": "tsconfig.*.json"
   },
   "cSpell.words": [
+    "ahooks",
     "antd",
     "antdv",
     "cssinjs",
